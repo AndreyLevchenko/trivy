@@ -230,10 +230,11 @@ func (s Scanner) scanLibrary(apps []ftypes.Application, options types.ScanOption
 			Vulnerabilities: vulns,
 			Class:           types.ClassLangPkg,
 			Type:            app.Type,
+			Dependencies:    app.Dependencies,
 		}
+
 		if options.ListAllPackages {
 			libReport.Packages = app.Libraries
-			libReport.Dependencies = app.Dependencies
 		}
 		results = append(results, libReport)
 	}

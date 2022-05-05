@@ -10,6 +10,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/olekukonko/tablewriter"
+	"github.com/xlab/treeprint"
 	"golang.org/x/exp/slices"
 
 	ftypes "github.com/aquasecurity/fanal/types"
@@ -29,6 +30,23 @@ type TableWriter struct {
 	// For misconfigurations
 	IncludeNonFailures bool
 	Trace              bool
+}
+
+//TODO move to separate file && add unit tests
+type dependencyTree struct {
+	id           string
+	isChild      bool
+	isVulnerable bool
+	children     []*dependencyTree
+}
+
+func (dt *dependencyTree) dependsOn(parent *dependencyTree) bool {
+	for _, child := range dt.children {
+		if child == parent || child.dependsOn(parent) {
+			return true
+		}
+	}
+	return false
 }
 
 // Write writes the result on standard output
@@ -236,47 +254,100 @@ func (tw TableWriter) setMisconfRows(table *tablewriter.Table, misconfs []types.
 	}
 	return severityCount
 }
-func (tw TableWriter) renderDepParent(item types.DependencyTreeItem, level int, isLastItem bool) {
-	var line string
-	padding := strings.Repeat(" ", level*2)
-	if item.Parents != nil {
-		line = fmt.Sprintf(" %s└─┬ %s", padding, item.ID)
-	} else {
-		if isLastItem {
-			line = fmt.Sprintf(" %s└── %s", padding, item.ID)
-		} else {
-			line = fmt.Sprintf(" %s├── %s", padding, item.ID)
-		}
-	}
-	tw.Println(line)
-	for i, parent := range item.Parents {
-		tw.renderDepParent(parent, level+1, i+1 == len(item.Parents))
-	}
 
-}
 func (tw TableWriter) renderDependencies(result types.Result) {
+	depsMap := make(map[string]*dependencyTree)
 
-	for _, vuln := range result.Vulnerabilities { //precheck
-		if vuln.PkgParents != nil {
-			tw.Println()
-			tw.Println("Reversed dependencies:")
-			tw.Println("=======================")
-			tw.Println()
+	vulnIds := make(map[string]interface{})
 
-			break
-		}
+	for _, vuln := range result.Vulnerabilities {
+
+		vulnIds[vuln.PkgID] = new(interface{})
 	}
 
-	seen := make([]string, 0)
-	for _, vuln := range result.Vulnerabilities {
-		if vuln.PkgParents != nil && !slices.Contains(seen, vuln.PkgID) {
-			tw.Println("", vuln.PkgID)
-			seen = append(seen, vuln.PkgID)
-			for i, parent := range vuln.PkgParents {
-				tw.renderDepParent(parent, 0, i+1 == len(vuln.PkgParents))
+	for _, gdep := range result.Dependencies {
+		parent, found := depsMap[gdep.ID]
+		if !found {
+			_, isVulnerable := vulnIds[gdep.ID]
+			parent = &dependencyTree{
+				id:           gdep.ID,
+				isVulnerable: isVulnerable,
+			}
+			depsMap[gdep.ID] = parent
+		}
+
+		for _, dependsOn := range gdep.DependsOn {
+			var child *dependencyTree
+
+			child, found := depsMap[dependsOn]
+			if !found {
+				_, isVulnerable := vulnIds[dependsOn]
+
+				child = &dependencyTree{
+					id:           dependsOn,
+					isVulnerable: isVulnerable,
+					isChild:      true,
+				}
+
+				depsMap[dependsOn] = child
+			}
+			child.isChild = true
+			/*
+				check if child has reference to parent through it's children to avoid cyclic loops
+			*/
+
+			if !child.dependsOn(parent) {
+				parent.children = append(parent.children, child)
 			}
 		}
 	}
+
+	roots := make([]*dependencyTree, 0)
+
+	for _, item := range depsMap {
+		if !item.isChild {
+			roots = append(roots, item)
+		}
+	}
+
+	roots = filterTree(roots, vulnIds)
+
+	if len(roots) > 0 {
+		tw.Println()
+		tw.Println("Detected dependencies:")
+		tw.Println("=======================")
+		tw.Println()
+	}
+
+	for _, item := range roots {
+		tree := toTree(item)
+		tw.Println(tree.String())
+	}
+}
+func toTree(item *dependencyTree) treeprint.Tree {
+	treeText := item.id
+	if item.isVulnerable {
+		treeText = color.New(color.FgRed).SprintFunc()("*" + item.id)
+	}
+
+	tree := treeprint.NewWithRoot(treeText)
+
+	for _, child := range item.children {
+		tree.AddBranch(toTree(child))
+	}
+	return tree
+}
+func filterTree(items []*dependencyTree, vulnIds map[string]interface{}) []*dependencyTree {
+	filtered := make([]*dependencyTree, 0)
+	for _, item := range items {
+		filteredChildren := filterTree(item.children, vulnIds)
+
+		if _, isVulnerable := vulnIds[item.id]; isVulnerable || len(filteredChildren) > 0 {
+			item.children = filteredChildren
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 func (tw TableWriter) setSecretRows(table *tablewriter.Table, secrets []ftypes.SecretFinding) map[string]int {
